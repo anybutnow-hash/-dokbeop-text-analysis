@@ -1,0 +1,790 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A5BB0">
+<title>讀法 · 텍스트 분석 콘솔</title>
+<style>html,body,#root{min-height:100%;margin:0;}body{background:#D7EBF4;}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"></div>
+<noscript>이 페이지는 JavaScript가 필요합니다.</noscript>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+/* ──────────────────────────────────────────────────────────
+   讀法 · 텍스트 분석 콘솔 (v2)
+   · 소설 등 서사 텍스트 분석 도구
+   · 제공자: Claude(Anthropic) / Gemini(Google) / GPT(OpenAI), 본인 API 키로 직접 호출
+   · 체크한 질문을 하나로 묶어 단일 호출 · 프롬프트 캐싱
+   · 토큰→글자/단어 환산 · 결과를 PDF / 진짜 DOCX로 내보내기
+   ────────────────────────────────────────────────────────── */
+
+const KRW_RATE = 1385;
+const MAX_WORK = 50000;
+
+/* 단가: 백만 토큰당 USD (2026-10-01 각 사 공식 가격표 기준)
+   cr = 캐시 적중(읽기) 배수, cw = 캐시 기록 배수(0이면 기록 할증 없음)
+   promo = 기한부 할인가. until 이후엔 after 단가로 자동 전환 */
+const MODELS = {
+  claude: {
+    label: "Claude · Anthropic", keyLabel: "Anthropic API 키", keyHint: "sk-ant-...",
+    list: [
+      { id: "claude-sonnet-5-5", label: "Sonnet 5.5", in: 2, out: 10, cr: 0.1, cw: 1.25 },
+      { id: "claude-haiku-4-5-20251001", label: "Haiku 4.5", in: 1, out: 5, cr: 0.1, cw: 1.25 },
+      { id: "claude-opus-5-5", label: "Opus 5.5", in: 4, out: 20, cr: 0.05, cw: 1.25 },
+      { id: "claude-fable-5-1", label: "Fable 5.1", in: 10, out: 50, cr: 0.025, cw: 1.25 },
+    ],
+  },
+  gemini: {
+    label: "Gemini · Google", keyLabel: "Google AI Studio API 키", keyHint: "AIza...",
+    list: [
+      { id: "gemini-3.1-pro-preview", label: "3.1 Pro (Preview)", in: 2, out: 12, cr: 0.1, cw: 0 },
+      { id: "gemini-3.6-flash", label: "3.6 Flash", in: 1.5, out: 7.5, cr: 0.1, cw: 0,
+        promo: { until: "2026-12-31", in: 0.75, out: 3.75 } },
+      { id: "gemini-3.5-flash-lite", label: "3.5 Flash-Lite", in: 0.3, out: 2.5, cr: 0.1, cw: 0 },
+    ],
+  },
+  openai: {
+    label: "GPT · OpenAI", keyLabel: "OpenAI API 키", keyHint: "sk-...",
+    list: [
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", in: 2, out: 10, cr: 0.05, cw: 1.25 },
+      { id: "gpt-6-luna", label: "GPT-6 Luna", in: 0.1, out: 0.5, cr: 0.1, cw: 1.25 },
+      { id: "gpt-6-astra", label: "GPT-6 Astra", in: 10, out: 50, cr: 0.1, cw: 1.25 },
+    ],
+  },
+};
+
+/* 기한부 할인 반영: 오늘 날짜(로컬)가 promo.until 이하이면 할인가 */
+function effectivePrice(m) {
+  if (m.promo) {
+    const d = new Date();
+    const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    if (today <= m.promo.until) return { in: m.promo.in, out: m.promo.out, promo: true };
+  }
+  return { in: m.in, out: m.out, promo: false };
+}
+const pct = (x) => `${+(x * 100).toFixed(1)}%`;
+
+const SYSTEM_PROMPT =
+  "너는 한국 문학 비평가이자 정밀 텍스트 분석가다. " +
+  "사용자가 제공한 작품(과 작가가 덧붙인 배경 정보·요구사항)만을 근거로, 주어진 분석 질문들에 답한다. " +
+  "추상적 단정 대신 작품 속 구체적 표현·문장·구조를 지목하거나 짧게 인용해 논증한다. " +
+  "없는 내용은 지어내지 않으며, 텍스트가 빈약하면 빈약하다고 정직하게 말한다. " +
+  "간결하고 밀도 높은 비평 산문으로, 한국어로 답한다. 군더더기 인사말은 생략한다.";
+
+const buildStable = (info, work) => {
+  const ctx = info && info.trim() ? `[작가가 제공한 배경 정보 및 요구사항]\n${info.trim()}\n\n` : "";
+  return `${ctx}[분석 대상 작품 본문]\n────────\n${work}\n────────`;
+};
+
+const GROUPS = [
+  {
+    id: "I", title: "화자·시점·관계", caption: "누가, 어디서 말하는가",
+    questions: [
+      { id: "I-1", label: "초점화자 / 거리와 온도", inst: "이 작품의 초점화자(focalizer)가 누구인지 특정하고, 서술자가 인물과 사건에 대해 유지하는 심리적·서술적 '거리'와 정서적 '온도'를 분석하라. 시점 유형(1인칭/3인칭 제한·자유간접화법 등)도 함께 짚어라." },
+      { id: "I-2", label: "화자–인물 관계 (밀착·분리·동화)", inst: "서술자와 등장인물의 관계가 밀착·분리·동화 중 어디에 가까운지 서술 태도를 근거로 판단하라. 거리가 변동한다면 그 전환 지점도 지목하라." },
+      { id: "I-3", label: "관계의 권력구도", inst: "위 화자–인물 관계가 형성하는 권력구도를 분석하라. 누가 보고 누가 보여지는가, 서술의 권한이 누구에게 있고 누가 침묵당하는가를 중심으로 보라." },
+      { id: "I-4", label: "주요 인물 분석", inst: "작품의 주요 인물만 골라 한 명씩 분석하라(비중이 낮은 단역·배경 인물은 제외). 각 인물의 욕망·결핍·서사적 기능·관계적 위치를 짚고, 그것이 어떤 문장·장면에서 드러나는지 근거와 함께 보라." },
+    ],
+  },
+  {
+    id: "II", title: "문체·언어", caption: "어떻게 말하는가",
+    questions: [
+      { id: "II-1", label: "문장의 호흡 / 리듬·강약", inst: "문장의 호흡(길이·끊김), 리듬과 강약을 분석하라. 단문·장문의 배치, 행갈이적 효과, 반복과 휴지가 만드는 박자를 구체적 예와 함께 보라." },
+      { id: "II-2", label: "구어체–문어체 배합", inst: "구어체와 문어체의 배합 양상을 분석하라. 어느 층위에서 어떤 문체가 쓰이며 그 전환이 어떤 효과를 내는지 보라." },
+      { id: "II-3", label: "감각 위계", inst: "이 작품이 주로 동원하는 감각의 위계를 분석하라. 시각·청각·촉각·후각·미각 중 무엇이 지배적이고 무엇이 억제되는지, 그것이 세계 인식과 어떻게 연결되는지 보라." },
+      { id: "II-4", label: "비유의 작동 방식", inst: "비유(은유·직유·환유 등)가 작동하는 방식을 분석하라. 비유가 장식인지 인식 도구인지, 원관념과 보조관념의 거리, 반복 패턴을 보라." },
+      { id: "II-5", label: "언어학적 지형 (종합)", inst: "위 문체 요소들을 종합해 이 작품의 '언어학적 지형'을 좌표화하라. 어휘 선택, 통사 구조, 문체적 표지(레지스터·결속성·전경화)의 특징을 통합적으로 기술하라." },
+      { id: "II-6", label: "문체의 장점과 약점", inst: "이 문체의 장점과 약점을 비평가의 시선에서 균형 있게 평가하라. 무엇이 강하게 작동하고 무엇이 과잉이거나 위험 요소인지 지적하라." },
+    ],
+  },
+  {
+    id: "III", title: "서사·구조·장르", caption: "어떤 틀로 말하는가",
+    questions: [
+      { id: "III-1", label: "서사 / 플롯 구조", inst: "서사와 플롯의 구조를 분석하라. 시간 구성(선조/역행/병치), 정보 배분, 긴장의 설계, 결말 처리 방식을 보라." },
+      { id: "III-2", label: "가장 특징적인 부분 (연출·구조 분리)", inst: "이 글에서 가장 특징적이고 눈에 띄는 부분을 짚되, '연출(문장·기법 차원의 처리)'과 '구조(서사·구성 차원의 설계)'를 각각 별도의 항목으로 명확히 나누어 설명하라." },
+      { id: "III-3", label: "장르문법의 사용", inst: "이 작품이 장르문법을 어떻게 사용하는지 분석하라. 관습을 따르는지, 비트는지, 의도적으로 위반·재배치하는지를 구체적으로 보라." },
+      { id: "III-4", label: "장르상 위치 (좌표)", inst: "이 작품이 장르의 지형 위에서 어느 좌표에 위치하는지 규정하라. 인접 장르와의 거리, 하위장르적 소속을 함께 보라." },
+      { id: "III-5", label: "장르·매체 계보", inst: "이 작품의 장르적·매체적 계보를 추적하라. 어떤 전통·매체(웹소설/순문학/장르소설/게임·영상 서사 등)에서 왔는지, 그 흔적을 텍스트에서 지목하라." },
+    ],
+  },
+  {
+    id: "IV", title: "주제·세계·규범", caption: "무엇을, 어떤 입장에서 말하는가",
+    questions: [
+      { id: "IV-1", label: "중점 개념과 용법", inst: "이 작품에서 중점적으로 활용되는 개념(들)을 특정하고, 그 개념이 작품 안에서 통상적 의미와 어떻게 같거나 다르게 쓰이는지 분석하라." },
+      { id: "IV-2", label: "세계의 의미 (독자·인물 관계)", inst: "이 작품에서 '세계'가 갖는 의미를 분석하라. 세계가 인물·독자와 맺는 관계(적대적/무관심/공모적 등)와 그 세계관적 전제를 보라." },
+      { id: "IV-3", label: "도덕·윤리·규범적 태도", inst: "이 작품이 도덕적·윤리적·규범적으로 어떤 위치에서 어떤 태도를 취하는지 분석하라. 판단을 유보하는지, 특정 규범을 옹호·해체하는지를 보라." },
+      { id: "IV-4", label: "정치적 지형", inst: "이 글의 정치적 지형을 분석하라. 좌/우, 권위주의/자유주의, 공동체주의/개인주의, 규범주의/해체 등의 축에서 텍스트가 어디에 놓이는지 근거를 들어 위치시켜라. 작가 개인이 아니라 텍스트의 정치성에 한정하라." },
+      { id: "IV-5", label: "철학적 지형", inst: "이 글의 철학적 지형을 분석하라. 존재·인식·윤리·시간·타자 등에 대한 텍스트의 암묵적 입장과, 연상되는 철학적 계열을 짚어라." },
+    ],
+  },
+  {
+    id: "V", title: "교차 독법 — 퀴어·정신과적 독해", caption: "다른 렌즈로 다시 읽기",
+    questions: [
+      { id: "V-1", label: "퀴어 서사 — 성지향성", inst: "이 작품을 성지향성(sexual orientation) 관점에서 분석하라. 인물들의 끌림·욕망의 방향과 그 재현 방식, 이성애 규범과의 관계, 동성애·양성애 등 비이성애적 욕망이 텍스트에서 어떻게 드러나거나 암시·억압되는지를 근거와 함께 보라." },
+      { id: "V-2", label: "퀴어 서사 — 에이스펙트럼", inst: "이 작품을 에이스펙트럼(무성애·무로맨스 등) 관점에서 분석하라. 성적·로맨틱 끌림의 부재나 약함, 비규범적 친밀성과 관계 양식, 끌림을 전제하지 않는 유대가 텍스트에서 어떻게 나타나는지를 근거와 함께 보라." },
+      { id: "V-3", label: "퀴어 서사 — 성정체성", inst: "이 작품을 성정체성(gender identity) 관점에서 분석하라. 인물의 젠더 정체화와 수행, 시스젠더 규범과의 관계, 트랜스·논바이너리 등 비규범적 젠더 경험의 흔적이나 젠더의 유동성이 텍스트에서 어떻게 드러나는지를 근거와 함께 보라." },
+      { id: "V-4", label: "정신과적 분석 (신경다양성 포함)", inst: "이 작품을 정신과적·임상적 관점에서 분석하라(신경다양성 포함). 인물의 정신적 상태·인지 양식·정동, 트라우마나 정신과적 증상으로 읽힐 수 있는 묘사, 신경다양성(자폐·ADHD 등)으로 해석 가능한 특징을 텍스트 근거와 함께 짚되, 실재 인물에 대한 진단이 아니라 어디까지나 텍스트 독해임을 전제로 신중히 다루라." },
+      { id: "V-5", label: "가능한 독법 (종합)", inst: "이 작품에 적용할 수 있는 비평적 독법을 폭넓고 자세히 제시하라. 위의 퀴어·정신과적 독해 외에도 언어학·여성학/젠더·정신분석·탈식민·계급·생태 등 생산적으로 적용 가능한 렌즈를 가능한 한 여러 개 다루고, 각 렌즈가 이 텍스트에서 구체적으로 무엇을 드러내는지 근거와 함께 충분히 설명하라. 작가가 요구사항에 특정 관점을 추가하라고 지정했다면 그 관점을 반드시 우선 포함하라." },
+    ],
+  },
+  {
+    id: "VI", title: "작가론·계보·수용", caption: "텍스트 바깥",
+    questions: [
+      { id: "VI-1", label: "작가의 취향과 가치관", inst: "이 텍스트로부터 역산되는 작가의 취향과 가치관을 추정하라. 무엇을 아름답다/중요하다 여기고 무엇을 회피하는지 근거와 함께 보라. 단정이 아니라 텍스트 기반 추론으로." },
+      { id: "VI-2", label: "창작 사고과정 (추정)", inst: "작가가 이 작품을 어떤 사고과정을 통해 창작했을지 추정하라. 무엇이 먼저 떠올랐고 어떤 순서로 설계되었을지 텍스트의 흔적에서 역추적하라." },
+      { id: "VI-3", label: "정체성·사회적 경험과 텍스트", inst: "작가의 추정되는 정체성·사회적 경험이 이 글과 어떤 관계를 맺었을지 분석하라. 특정 개인을 단정하지 말고 텍스트가 시사하는 경험의 결로 한정하라." },
+      { id: "VI-4", label: "추정되는 장르·매체 경험", inst: "텍스트에 드러난 흔적을 근거로 작가의 장르적·매체적 경험(읽기·보기·플레이 이력 등)을 추정하라." },
+      { id: "VI-5", label: "문학사 계보 / 지형", inst: "이 작품이 문학사의 계보 위에서 어디에 위치하는지 규정하라. 선행 작가·사조와의 친연성과 차이를 짚어 문학사적 좌표를 부여하라." },
+      { id: "VI-6", label: "대중성 / 타겟 독자", inst: "이 작품의 대중성을 평가하고, 타겟 독자를 어떻게 설정하면 좋을지 제안하라. 진입장벽, 소구점, 적합한 플랫폼·독자층을 구체적으로 보라." },
+    ],
+  },
+];
+
+const ALL_QIDS = GROUPS.flatMap((g) => g.questions.map((q) => q.id));
+const Q_LABEL = Object.fromEntries(GROUPS.flatMap((g) => g.questions.map((q) => [q.id, q.label])));
+const Q_INST = Object.fromEntries(GROUPS.flatMap((g) => g.questions.map((q) => [q.id, q.inst])));
+
+function buildCombinedInstruction(ids) {
+  const ordered = ALL_QIDS.filter((id) => ids.includes(id));
+  const items = ordered.map((id, i) => `${i + 1}) [${id}] ${Q_LABEL[id]}\n   ${Q_INST[id]}`).join("\n\n");
+  return (
+    `아래 ${ordered.length}개의 분석 질문에 대해 한 번에 모두 답하라.\n` +
+    `각 답변은 반드시 "## [질문ID] 질문제목" 형식의 머리말로 시작하고, 제시된 순서대로 작성하라.\n` +
+    `각 질문은 독립된 절로 충분히 답하되, 앞 절과 겹치는 내용은 되풀이하지 말고 필요하면 간단히 가리켜라.\n\n` +
+    items +
+    `\n\n[요구사항 반영 지침]\n` +
+    `본문 앞에 '작가가 제공한 배경 정보 및 요구사항'이 있다면 다음을 따르라.\n` +
+    `- 특정 질문을 더 자세히/깊이 분석해 달라는 요청이 있으면 해당 절을 더 길고 구체적으로 작성하라.\n` +
+    `- '가능한 독법'에 추가하라고 명시한 관점이 있으면 그 관점을 V-5 절에 반드시 포함하라.\n` +
+    `- 위 목록에 없는, 사용자가 직접 적은 질문이 있으면 그에 대한 답을 맨 마지막에 "## 7. 추가 질문" 절로 따로 작성하라. 그런 질문이 없으면 이 절은 만들지 마라.`
+  );
+}
+
+function estTokens(str) {
+  if (!str) return 0;
+  let cjk = 0, other = 0;
+  for (const ch of str) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0xac00 && c <= 0xd7a3) || (c >= 0x3000 && c <= 0x9fff)) cjk++; else other++;
+  }
+  return Math.ceil(cjk * 1.1 + other * 0.3);
+}
+const estWords = (str) => (str && str.trim() ? str.trim().split(/\s+/).length : 0);
+const usd = (n) => "$" + n.toFixed(4);
+const krw = (n) => "₩" + Math.round(n * KRW_RATE).toLocaleString();
+const xmlEsc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const escapeHtml = xmlEsc;
+const inlineMd = (s) => s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+function mdToHtml(text) {
+  const lines = escapeHtml(text).split(/\r?\n/);
+  let html = "", para = [];
+  const flush = () => { if (para.length) { html += `<p>${para.join("<br>")}</p>`; para = []; } };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flush(); const lvl = Math.min(h[1].length + 1, 4); html += `<h${lvl}>${inlineMd(h[2])}</h${lvl}>`; continue; }
+    if (line.trim() === "") { flush(); continue; }
+    para.push(inlineMd(line));
+  }
+  flush();
+  return html;
+}
+
+async function askModel({ provider, model, apiKey, maxTokens, info, work, instruction, caching }) {
+  const key = (apiKey || "").trim();
+  const stable = buildStable(info, work);
+  const variable = `\n\n${instruction}`;
+
+  if (provider === "gemini") {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: stable + variable }] }],
+        generationConfig: { maxOutputTokens: maxTokens },
+      }),
+    });
+    if (!res.ok) { let d = `HTTP ${res.status}`; try { const e = await res.json(); if (e?.error?.message) d = e.error.message; } catch (_) {} throw new Error(d); }
+    const data = await res.json();
+    const cand = data.candidates && data.candidates[0];
+    let text = (cand?.content?.parts || []).map((p) => p.text || "").join("").trim();
+    const um = data.usageMetadata || {};
+    const inTok = um.promptTokenCount || 0;
+    const outTok = (um.candidatesTokenCount || 0) + (um.thoughtsTokenCount || 0);
+    const cacheRead = um.cachedContentTokenCount || 0;
+    if (!text) {
+      if (cand?.finishReason === "MAX_TOKENS") text = "(출력 상한에 막혀 본문이 비었거나 잘렸습니다. Gemini 3.x는 내부 '사고 토큰'도 출력 상한에서 소모하므로 출력 상한을 넉넉히 올려 다시 시도하세요.)";
+      else if (cand?.finishReason === "SAFETY") text = "(안전 필터로 응답이 차단되었습니다.)";
+      else text = "(빈 응답)";
+    }
+    return { text, inTok, outTok, cacheRead, cacheWrite: 0 };
+  }
+
+  if (provider === "openai") {
+    /* Responses API. 캐싱 체크 시 본문 블록 끝에 명시적 캐시 지점을 둔다.
+       explicit 모드에서 지점이 없으면 캐싱·기록 할증 모두 발생하지 않음 */
+    const stableBlock = { type: "input_text", text: stable };
+    if (caching) stableBlock.prompt_cache_breakpoint = { mode: "explicit" };
+    const res = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model,
+        max_output_tokens: maxTokens,
+        prompt_cache_options: { mode: "explicit" },
+        input: [
+          { role: "developer", content: [{ type: "input_text", text: SYSTEM_PROMPT }] },
+          { role: "user", content: [stableBlock, { type: "input_text", text: variable }] },
+        ],
+      }),
+    });
+    if (!res.ok) { let d = `HTTP ${res.status}`; try { const e = await res.json(); if (e?.error?.message) d = e.error.message; } catch (_) {} throw new Error(d); }
+    const data = await res.json();
+    let text = "", refusal = "";
+    for (const item of data.output || []) {
+      if (item.type !== "message") continue;
+      for (const c of item.content || []) {
+        if (c.type === "output_text") text += c.text || "";
+        else if (c.type === "refusal") refusal += c.refusal || "";
+      }
+    }
+    if (!text && typeof data.output_text === "string") text = data.output_text;
+    text = text.trim();
+    const u = data.usage || {};
+    const det = u.input_tokens_details || {};
+    const truncated = data.status === "incomplete" && data.incomplete_details?.reason === "max_output_tokens";
+    if (!text) {
+      if (truncated) text = "(출력 상한에 막혀 본문이 비었습니다. GPT-6 계열은 내부 추론 토큰도 출력 상한에서 소모하므로 출력 상한을 넉넉히 올려 다시 시도하세요.)";
+      else if (refusal) text = `(응답 거부: ${refusal})`;
+      else text = "(빈 응답)";
+    } else if (truncated) {
+      text += "\n\n(※ 출력 상한에 도달해 여기서 잘렸습니다.)";
+    }
+    return { text, inTok: u.input_tokens || 0, outTok: u.output_tokens || 0, cacheRead: det.cached_tokens || 0, cacheWrite: det.cache_write_tokens || 0 };
+  }
+
+  const headers = { "Content-Type": "application/json" };
+  if (key) { headers["x-api-key"] = key; headers["anthropic-version"] = "2023-06-01"; headers["anthropic-dangerous-direct-browser-access"] = "true"; }
+  const system = caching ? [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }] : SYSTEM_PROMPT;
+  const content = caching
+    ? [{ type: "text", text: stable, cache_control: { type: "ephemeral" } }, { type: "text", text: variable }]
+    : stable + variable;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers,
+    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: "user", content }] }),
+  });
+  if (!res.ok) { let d = `HTTP ${res.status}`; try { const e = await res.json(); if (e?.error?.message) d = e.error.message; } catch (_) {} throw new Error(d); }
+  const data = await res.json();
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim() || "(빈 응답)";
+  const u = data.usage || {};
+  const uncached = u.input_tokens || 0;
+  const cacheWrite = u.cache_creation_input_tokens || 0;
+  const cacheRead = u.cache_read_input_tokens || 0;
+  return { text, inTok: uncached + cacheWrite + cacheRead, outTok: u.output_tokens || 0, cacheRead, cacheWrite };
+}
+
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+function printHTML(html) {
+  const w = window.open("", "_blank");
+  if (w) { w.document.write(html); w.document.close(); w.focus(); setTimeout(() => w.print(), 500); return; }
+  const f = document.createElement("iframe");
+  Object.assign(f.style, { position: "fixed", right: "0", bottom: "0", width: "0", height: "0", border: "0" });
+  document.body.appendChild(f);
+  const d = f.contentWindow.document; d.open(); d.write(html); d.close();
+  setTimeout(() => { try { f.contentWindow.focus(); f.contentWindow.print(); } catch (_) {} }, 600);
+}
+function loadJSZip() {
+  return new Promise((resolve, reject) => {
+    if (window.JSZip) return resolve(window.JSZip);
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    s.onload = () => (window.JSZip ? resolve(window.JSZip) : reject(new Error("JSZip 로드 실패")));
+    s.onerror = () => reject(new Error("JSZip 로드 실패 (인터넷 연결 필요)"));
+    document.head.appendChild(s);
+  });
+}
+
+/* ── DOCX(OOXML) 생성 ── */
+const DOCX_CONTENT_TYPES =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+  `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+  `<Default Extension="xml" ContentType="application/xml"/>` +
+  `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
+  `<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>` +
+  `</Types>`;
+const DOCX_RELS =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+  `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+  `</Relationships>`;
+const DOCX_DOCRELS =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+  `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
+  `</Relationships>`;
+const DOCX_STYLES =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+  `<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Malgun Gothic" w:hAnsi="Malgun Gothic" w:eastAsia="\uB9D1\uC740 \uACE0\uB515"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>` +
+  `<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:spacing w:after="160" w:line="312" w:lineRule="auto"/></w:pPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:pPr><w:spacing w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="44"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Meta"><w:name w:val="Meta"/><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="6" w:color="13293D"/></w:pBdr><w:spacing w:after="320"/></w:pPr><w:rPr><w:color w:val="4A6B85"/><w:sz w:val="18"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:pBdr><w:bottom w:val="single" w:sz="4" w:space="4" w:color="B6D4E4"/></w:pBdr><w:spacing w:before="320" w:after="120"/></w:pPr><w:rPr><w:b/><w:color w:val="0A5BB0"/><w:sz w:val="30"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="240" w:after="100"/></w:pPr><w:rPr><w:b/><w:color w:val="0A5BB0"/><w:sz w:val="26"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="heading 4"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="80"/></w:pPr><w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="InfoHead"><w:name w:val="InfoHead"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:after="40"/></w:pPr><w:rPr><w:b/><w:color w:val="4A6B85"/><w:sz w:val="18"/></w:rPr></w:style>` +
+  `<w:style w:type="paragraph" w:styleId="Info"><w:name w:val="Info"/><w:basedOn w:val="Normal"/><w:pPr><w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="0A5BB0"/></w:pBdr><w:ind w:left="160"/><w:spacing w:after="60"/></w:pPr><w:rPr><w:color w:val="2A3F52"/><w:sz w:val="20"/></w:rPr></w:style>` +
+  `</w:styles>`;
+const DOCX_DOC_OPEN =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>`;
+const DOCX_DOC_CLOSE =
+  `<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+
+function inlineRuns(text) {
+  const parts = String(text).split(/\*\*(.+?)\*\*/g);
+  const runs = [];
+  parts.forEach((p, i) => { if (p !== "") runs.push({ text: p, bold: i % 2 === 1 }); });
+  if (runs.length === 0) runs.push({ text: " ", bold: false });
+  return runs;
+}
+const paraXml = (style, runs) => {
+  const r = runs.map((x) => `<w:r>${x.bold ? "<w:rPr><w:b/></w:rPr>" : ""}<w:t xml:space="preserve">${xmlEsc(x.text)}</w:t></w:r>`).join("");
+  return `<w:p>${style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : ""}${r}</w:p>`;
+};
+const hStyle = (c) => (c <= 2 ? "Heading2" : c === 3 ? "Heading3" : "Heading4");
+
+function buildDocumentXml({ title, modelLabel, info, text }) {
+  const date = new Date().toLocaleString("ko-KR");
+  let body = "";
+  body += paraXml("Title", [{ text: title || "텍스트 분석", bold: false }]);
+  body += paraXml("Meta", [{ text: `분석 모델 ${modelLabel} · ${date}`, bold: false }]);
+  if (info && info.trim()) {
+    body += paraXml("InfoHead", [{ text: "작가·작품 정보 및 요구사항", bold: false }]);
+    info.replace(/\r/g, "").split("\n").forEach((line) => { body += paraXml("Info", inlineRuns(line.length ? line : " ")); });
+  }
+  text.replace(/\r/g, "").split("\n").forEach((raw) => {
+    const line = raw.replace(/\s+$/, "");
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { body += paraXml(hStyle(h[1].length), inlineRuns(h[2])); return; }
+    if (line.trim() === "") return;
+    body += paraXml("", inlineRuns(line));
+  });
+  return DOCX_DOC_OPEN + body + DOCX_DOC_CLOSE;
+}
+
+async function makeDocxBlob({ title, modelLabel, info, text }) {
+  const JSZipLib = await loadJSZip();
+  const zip = new JSZipLib();
+  zip.file("[Content_Types].xml", DOCX_CONTENT_TYPES);
+  zip.folder("_rels").file(".rels", DOCX_RELS);
+  const wf = zip.folder("word");
+  wf.file("styles.xml", DOCX_STYLES);
+  wf.folder("_rels").file("document.xml.rels", DOCX_DOCRELS);
+  wf.file("document.xml", buildDocumentXml({ title, modelLabel, info, text }));
+  return zip.generateAsync({ type: "blob", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+}
+
+const css = `
+.dk-wrap{
+  --paper:#D7EBF4; --raised:#FFFFFF; --field:#EAF4FB; --ink:#13293D; --ink2:#4A6B85;
+  --line:#B6D4E4; --accent:#0A5BB0; --accent2:#084A91; --accentbg:#0A5BB014;
+  background:var(--paper); color:var(--ink); font-family:"Noto Serif KR", Georgia, serif;
+  min-height:100%; padding:32px 20px 96px; box-sizing:border-box; -webkit-font-smoothing:antialiased; -webkit-text-size-adjust:100%;
+}
+.dk-shell{ max-width:760px; margin:0 auto; }
+.dk-head{ border-bottom:1.5px solid var(--ink); padding-bottom:14px; margin-bottom:24px; }
+.dk-mark{ font-size:11px; letter-spacing:.45em; color:var(--accent); font-family:"Noto Sans KR",sans-serif; margin-bottom:10px; }
+.dk-title{ font-size:30px; font-weight:900; letter-spacing:-.01em; line-height:1.1; margin:0; }
+.dk-title small{ font-weight:400; font-size:18px; color:var(--ink2); margin-left:8px; }
+.dk-sub{ margin:8px 0 0; font-size:13px; color:var(--ink2); }
+
+.dk-label{ font-family:"Noto Sans KR",sans-serif; font-size:11px; letter-spacing:.2em; color:var(--ink2); text-transform:uppercase; margin:22px 0 8px; }
+.dk-hint{ font-family:"Noto Sans KR",sans-serif; font-size:11px; color:var(--ink2); margin:-4px 0 8px; line-height:1.6; }
+.dk-ta{ width:100%; box-sizing:border-box; background:var(--raised); border:1px solid var(--line); border-radius:8px;
+  padding:14px 15px; font-family:"Noto Serif KR",serif; font-size:15px; line-height:1.75; color:var(--ink); outline:none; resize:vertical; }
+.dk-ta:focus{ border-color:var(--accent); }
+.dk-ta.info{ min-height:96px; } .dk-ta.work{ min-height:170px; }
+.dk-meta{ font-family:"Noto Sans KR",sans-serif; font-size:11px; color:var(--ink2); margin-top:6px; text-align:right; }
+.dk-meta.warn{ color:var(--accent2); }
+
+.dk-api{ background:var(--raised); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-top:8px; }
+.dk-apirow{ display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; }
+.dk-field{ flex:1 1 180px; } .dk-field.small{ flex:0 0 120px; } .dk-field.full{ flex:1 1 100%; }
+.dk-field label{ display:block; font-family:"Noto Sans KR",sans-serif; font-size:11px; letter-spacing:.1em; color:var(--ink2); margin-bottom:5px; }
+.dk-input,.dk-select{ width:100%; box-sizing:border-box; background:var(--field); border:1px solid var(--line); border-radius:6px;
+  padding:10px 12px; min-height:42px; font-family:"Noto Sans KR",sans-serif; font-size:13px; color:var(--ink); outline:none; }
+.dk-input:focus,.dk-select:focus{ border-color:var(--accent); }
+.dk-check{ display:flex; align-items:center; gap:8px; margin-top:12px; font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--ink); cursor:pointer; }
+.dk-check input{ width:15px; height:15px; accent-color:var(--accent); }
+.dk-apinote{ font-family:"Noto Sans KR",sans-serif; font-size:10.5px; color:var(--ink2); margin-top:10px; line-height:1.6; }
+
+.dk-cost{ border:1px solid var(--line); border-radius:8px; margin-top:14px; background:var(--raised); overflow:hidden; }
+.dk-costhd{ background:var(--ink); color:var(--paper); font-family:"Noto Sans KR",sans-serif; font-size:11px; letter-spacing:.2em; padding:7px 14px; }
+.dk-costbody{ padding:12px 14px; display:grid; grid-template-columns:1fr 1fr; gap:6px 18px; }
+.dk-crow{ display:flex; justify-content:space-between; gap:10px; font-family:"Noto Sans KR",sans-serif; font-size:12px; }
+.dk-crow span{ color:var(--ink2); } .dk-crow b{ font-weight:500; color:var(--ink); text-align:right; }
+.dk-crow .sub{ color:var(--ink2); font-weight:400; font-size:11px; }
+.dk-crow.big b{ color:var(--accent); font-size:13px; }
+.dk-crow.save b{ color:#0d7a5f; }
+.dk-costfoot{ font-family:"Noto Sans KR",sans-serif; font-size:10.5px; color:var(--ink2); padding:0 14px 12px; line-height:1.6; }
+.dk-costfoot b{ color:var(--ink); font-weight:500; }
+
+.dk-toolbar{ display:flex; align-items:center; gap:14px; margin:24px 0 8px; flex-wrap:wrap; }
+.dk-tcount{ font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--ink2); } .dk-tcount b{ color:var(--accent); }
+.dk-link{ font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--ink2); background:none; border:none; cursor:pointer; padding:2px 0; border-bottom:1px solid var(--line); }
+.dk-link:hover{ color:var(--ink); border-color:var(--ink); } .dk-link:disabled{ opacity:.4; cursor:not-allowed; }
+
+.dk-group{ margin-top:26px; }
+.dk-ghead{ display:flex; align-items:baseline; gap:14px; cursor:pointer; padding-bottom:8px; border-bottom:1px solid var(--line); }
+.dk-num{ font-size:26px; font-weight:900; color:var(--accent); line-height:1; min-width:40px; }
+.dk-gtitle{ font-size:17px; font-weight:600; margin:0; }
+.dk-gcap{ font-family:"Noto Sans KR",sans-serif; font-size:11.5px; color:var(--ink2); margin-left:auto; }
+.dk-gpick{ font-family:"Noto Sans KR",sans-serif; font-size:11px; color:var(--accent); background:none; border:none; cursor:pointer; padding:0; }
+
+.dk-q{ display:block; width:100%; text-align:left; background:none; border:none; cursor:pointer; padding:11px 6px 11px 54px;
+  position:relative; border-bottom:1px solid var(--line); font-family:"Noto Serif KR",serif; font-size:15px; color:var(--ink); line-height:1.5; }
+.dk-q:hover{ background:var(--accentbg); }
+.dk-box{ position:absolute; left:6px; top:11px; font-size:15px; font-family:"Noto Sans KR",sans-serif; color:var(--line); line-height:1.5; }
+.dk-q.on .dk-box{ color:var(--accent); }
+.dk-qid{ font-family:"Noto Sans KR",sans-serif; font-size:11px; color:var(--ink2); margin-right:8px; }
+
+.dk-result{ margin-top:24px; border:1px solid var(--line); border-radius:8px; background:var(--raised); overflow:hidden; }
+.dk-rhead{ display:flex; align-items:center; gap:12px; background:var(--ink); color:var(--paper);
+  font-family:"Noto Sans KR",sans-serif; font-size:11px; letter-spacing:.2em; padding:8px 16px; }
+.dk-rhead small{ margin-left:auto; letter-spacing:0; color:#AACFE6; font-size:10.5px; }
+.dk-rbody{ padding:16px 18px; }
+.dk-load{ font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--ink2); }
+.dk-err{ font-family:"Noto Sans KR",sans-serif; font-size:13px; color:var(--accent2); }
+.dk-md h2{ font-size:16px; color:var(--accent); border-bottom:1px solid var(--line); padding-bottom:5px; margin:20px 0 9px; }
+.dk-md h3{ font-size:15px; color:var(--accent); margin:18px 0 8px; }
+.dk-md h4{ font-size:14px; margin:14px 0 6px; }
+.dk-md h2:first-child,.dk-md h3:first-child{ margin-top:0; }
+.dk-md p{ font-size:14.5px; line-height:1.78; margin:0 0 10px; }
+.dk-md strong{ font-weight:600; }
+.dk-ractions{ display:flex; gap:10px; padding:2px 18px 16px; flex-wrap:wrap; align-items:center; }
+.dk-titlein{ flex:1 1 180px; background:var(--field); border:1px solid var(--line); border-radius:6px; padding:9px 12px; min-height:42px;
+  font-family:"Noto Serif KR",serif; font-size:13px; color:var(--ink); outline:none; }
+.dk-titlein:focus{ border-color:var(--accent); }
+.dk-xbtn{ font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--accent); background:var(--field);
+  border:1px solid var(--accent); border-radius:6px; padding:9px 14px; min-height:40px; cursor:pointer; }
+.dk-xbtn:hover{ background:var(--accent); color:#FFFFFF; }
+.dk-xbtn:disabled{ opacity:.4; cursor:not-allowed; }
+
+.dk-runbar{ position:sticky; bottom:0; margin-top:28px; padding:14px 0 4px;
+  background:linear-gradient(to top, var(--paper) 70%, transparent); display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+.dk-run{ font-family:"Noto Sans KR",sans-serif; font-size:14px; font-weight:500; color:#FFFFFF; background:var(--accent);
+  border:none; border-radius:8px; padding:12px 26px; cursor:pointer; letter-spacing:.04em; }
+.dk-run:hover{ background:var(--accent2); }
+.dk-run:disabled{ background:#A9C7DC; color:#EAF4FB; cursor:not-allowed; }
+.dk-progress{ font-family:"Noto Sans KR",sans-serif; font-size:12px; color:var(--ink2); }
+
+@media (max-width:560px){
+  .dk-wrap{ padding:20px 13px 104px; }
+  .dk-title{ font-size:23px; } .dk-title small{ display:block; margin:4px 0 0; font-size:15px; }
+  .dk-sub{ font-size:13px; }
+  .dk-input,.dk-select,.dk-ta,.dk-titlein{ font-size:16px; }
+  .dk-field,.dk-field.small,.dk-field.full{ flex:1 1 100%; }
+  .dk-ghead{ gap:10px; } .dk-gcap{ display:none; }
+  .dk-num{ min-width:28px; font-size:21px; }
+  .dk-gtitle{ font-size:16px; }
+  .dk-q{ padding:14px 6px 14px 38px; font-size:15px; } .dk-box{ left:2px; top:14px; }
+  .dk-costbody{ grid-template-columns:1fr; }
+  .dk-toolbar{ gap:10px 14px; }
+  .dk-rbody{ padding:14px 15px; }
+  .dk-ractions{ gap:8px; padding:2px 15px 16px; } .dk-titlein{ flex:1 1 100%; } .dk-xbtn{ flex:1 1 100%; text-align:center; padding:13px; }
+  .dk-runbar{ gap:8px 12px; }
+  .dk-run{ flex:1 1 100%; padding:15px; font-size:15px; }
+}
+@media (prefers-reduced-motion: reduce){ *{ transition:none !important; } }
+`;
+
+function App() {
+  const [provider, setProvider] = useState("claude");
+  const [model, setModel] = useState(MODELS.claude.list[0].id);
+  const [apiKey, setApiKey] = useState("");
+  const [maxTokens, setMaxTokens] = useState(4096);
+  const [caching, setCaching] = useState(true);
+  const [info, setInfo] = useState("");
+  const [work, setWork] = useState("");
+  const [title, setTitle] = useState("");
+  const [selected, setSelected] = useState({});
+  const [result, setResult] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [usage, setUsage] = useState({ inTok: 0, outTok: 0, cacheRead: 0, cost: 0, calls: 0 });
+
+  const prov = MODELS[provider];
+  const curModel = prov.list.find((m) => m.id === model) || prov.list[0];
+  const price = effectivePrice(curModel);
+  const priceIn = price.in / 1e6, priceOut = price.out / 1e6;
+  const CR = curModel.cr, CW = curModel.cw;
+
+  const selectedIds = useMemo(() => ALL_QIDS.filter((id) => selected[id]), [selected]);
+  const n = selectedIds.length;
+  const canRun = work.trim().length > 0 && n > 0 && !running;
+  const hasResult = result?.status === "done";
+
+  const charPerTok = work && estTokens(work) > 0 ? work.length / estTokens(work) : 0.95;
+  const approxCh = (tok) => Math.round(tok * charPerTok).toLocaleString();
+
+  const est = useMemo(() => {
+    const combinedInst = n ? estTokens(buildCombinedInstruction(selectedIds)) : 0;
+    const workTok = estTokens(work);
+    /* 캐시 대상 = 시스템 + 배경정보 + 본문 / 매번 바뀌는 부분 = 질문 지시문 */
+    const cacheTok = estTokens(SYSTEM_PROMPT) + estTokens(info) + workTok;
+    const varTok = combinedInst + 30;
+    const inputTok = cacheTok + varTok;
+    const outMax = maxTokens;
+    const useCache = caching || provider === "gemini";
+    const writeMult = useCache && CW > 0 ? CW : 1;
+    const costFull = (cacheTok * writeMult + varTok) * priceIn + outMax * priceOut;
+    const costCached = (cacheTok * (useCache ? CR : 1) + varTok) * priceIn + outMax * priceOut;
+    return { workTok, inputTok, outMax, costFull, costCached };
+  }, [info, work, selectedIds, n, maxTokens, priceIn, priceOut, caching, provider, CR, CW]);
+
+  const onProvider = (p) => { setProvider(p); setModel(MODELS[p].list[0].id); };
+  const toggle = (id) => setSelected((s) => ({ ...s, [id]: !s[id] }));
+  const toggleGroup = (g) => {
+    const ids = g.questions.map((q) => q.id);
+    const allOn = ids.every((id) => selected[id]);
+    setSelected((s) => { const x = { ...s }; ids.forEach((id) => (x[id] = !allOn)); return x; });
+  };
+  const setAll = (val) => setSelected(val ? Object.fromEntries(ALL_QIDS.map((id) => [id, true])) : {});
+
+  const calcCost = (inTok, outTok, cacheRead, cacheWrite) => {
+    const uncached = Math.max(0, inTok - cacheRead - cacheWrite);
+    return uncached * priceIn + cacheWrite * CW * priceIn + cacheRead * CR * priceIn + outTok * priceOut;
+  };
+
+  const run = async () => {
+    setRunning(true);
+    setResult({ status: "loading", text: "" });
+    try {
+      const instruction = buildCombinedInstruction(selectedIds);
+      const { text, inTok, outTok, cacheRead, cacheWrite } = await askModel({ provider, model, apiKey, maxTokens, info, work, instruction, caching });
+      const cost = calcCost(inTok, outTok, cacheRead, cacheWrite);
+      setResult({ status: "done", text, usage: { inTok, outTok, cacheRead, cacheWrite, cost, modelLabel: curModel.label } });
+      setUsage((s) => ({ inTok: s.inTok + inTok, outTok: s.outTok + outTok, cacheRead: s.cacheRead + cacheRead, cost: s.cost + cost, calls: s.calls + 1 }));
+    } catch (e) {
+      setResult({ status: "error", text: e.message || "알 수 없는 오류" });
+    }
+    setRunning(false);
+  };
+
+  const copyResult = () => { if (hasResult) navigator.clipboard?.writeText(result.text); };
+  const safeName = () => (title || "text-analysis").trim().replace(/[\\/:*?"<>|]/g, "_").slice(0, 60) || "text-analysis";
+
+  const buildExportHTML = () => {
+    const docTitle = (title || "텍스트 분석").trim();
+    const date = new Date().toLocaleString("ko-KR");
+    const infoBlock = info.trim()
+      ? `<div class="info"><div class="ih">작가·작품 정보 및 요구사항</div><p>${escapeHtml(info).replace(/\n/g, "<br>")}</p></div>` : "";
+    const style = `
+      @page{ margin:22mm 18mm; }
+      body{ font-family:'Noto Serif KR',serif; color:#13293D; line-height:1.75; max-width:720px; margin:32px auto; padding:0 18px; }
+      h1{ font-size:24px; margin:0 0 4px; }
+      .meta{ font-family:'Noto Sans KR',sans-serif; font-size:12px; color:#4A6B85; margin-bottom:22px; border-bottom:1.5px solid #13293D; padding-bottom:12px; }
+      .info{ background:#EAF4FA; border-left:3px solid #0A5BB0; padding:12px 16px; margin:0 0 26px; }
+      .info .ih{ font-family:'Noto Sans KR',sans-serif; font-size:11px; letter-spacing:.1em; color:#4A6B85; margin-bottom:6px; }
+      .info p{ margin:0; font-size:13.5px; }
+      h2{ font-size:16px; color:#0A5BB0; border-bottom:1px solid #B6D4E4; padding-bottom:6px; margin:24px 0 10px; page-break-after:avoid; }
+      h3{ font-size:15px; color:#0A5BB0; margin:18px 0 8px; } h4{ font-size:14px; margin:14px 0 6px; }
+      p{ margin:0 0 10px; font-size:14px; }
+    `;
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(docTitle)}</title>`
+      + `<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;900&family=Noto+Sans+KR&display=swap" rel="stylesheet"><style>${style}</style></head>`
+      + `<body><h1>${escapeHtml(docTitle)}</h1><div class="meta">분석 모델 ${escapeHtml(curModel.label)} · ${escapeHtml(date)}</div>${infoBlock}${mdToHtml(result.text)}</body></html>`;
+  };
+  const exportPDF = () => { if (hasResult) printHTML(buildExportHTML()); };
+  const exportDocx = async () => {
+    if (!hasResult || exporting) return;
+    setExporting(true);
+    try {
+      const blob = await makeDocxBlob({ title: (title || "텍스트 분석").trim(), modelLabel: curModel.label, info, text: result.text });
+      download(blob, safeName() + ".docx");
+    } catch (e) {
+      alert("DOCX 생성 실패: " + (e.message || e));
+    }
+    setExporting(false);
+  };
+
+  const overLimit = work.length >= MAX_WORK;
+  const ru = result?.usage;
+
+  return (
+    <div className="dk-wrap">
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;900&family=Noto+Sans+KR:wght@400;500&display=swap');`}</style>
+      <style>{css}</style>
+
+      <div className="dk-shell">
+        <header className="dk-head">
+          <div className="dk-mark">■ □ ■ &nbsp; T E X T &nbsp; A N A L Y S I S</div>
+          <h1 className="dk-title">讀法<small>· 텍스트 분석 콘솔</small></h1>
+          <p className="dk-sub">소설 등 서사 텍스트를 여러 관점에서 분석하는 도구입니다.</p>
+        </header>
+
+        {/* API 설정 */}
+        <p className="dk-label">API 설정</p>
+        <div className="dk-api">
+          <div className="dk-apirow">
+            <div className="dk-field">
+              <label>제공자</label>
+              <select className="dk-select" value={provider} onChange={(e) => onProvider(e.target.value)}>
+                {Object.entries(MODELS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </select>
+            </div>
+            <div className="dk-field">
+              <label>모델</label>
+              <select className="dk-select" value={model} onChange={(e) => setModel(e.target.value)}>
+                {prov.list.map((m) => { const p = effectivePrice(m); return <option key={m.id} value={m.id}>{m.label} (${p.in}/${p.out}{p.promo ? " 할인" : ""})</option>; })}
+              </select>
+            </div>
+            <div className="dk-field small">
+              <label>출력 상한</label>
+              <input className="dk-input" type="number" min={512} max={32768} step={256}
+                value={maxTokens} onChange={(e) => setMaxTokens(Math.max(512, Math.min(32768, Number(e.target.value) || 512)))} />
+            </div>
+            <div className="dk-field full">
+              <label>{prov.keyLabel}</label>
+              <input className="dk-input" type="password" autoComplete="off" spellCheck={false}
+                placeholder={prov.keyHint} value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+            </div>
+          </div>
+          <label className="dk-check">
+            <input type="checkbox" checked={caching} onChange={(e) => setCaching(e.target.checked)} />
+            프롬프트 캐싱 사용 — 같은 본문으로 다시 분석할 때 입력 비용 절감 (이 모델: 캐시분 단가의 {pct(CR)})
+          </label>
+          <div className="dk-apinote">
+            단가 입력 ${price.in} / 출력 ${price.out} (백만 토큰당){price.promo && curModel.promo ? ` — ${curModel.promo.until}까지 할인가, 이후 $${curModel.in} / $${curModel.out}로 자동 전환` : ""}. 캐시 적중 시 해당 입력은 단가의 {pct(CR)}로 과금{CW > 0 ? `, 첫 기록 시에는 ${CW}배` : ""}.
+            {provider === "gemini" && " Gemini는 공통 접두부를 자동(암묵) 캐싱하므로 체크와 무관하게 적용될 수 있고, 기록 할증은 없다."}
+            {provider === "openai" && " GPT는 캐시 지점까지 1,024토큰 이상일 때만 캐싱되며, 체크를 끄면 캐싱·기록 할증 모두 없이 호출한다. 출력 상한에는 내부 추론 토큰도 포함된다."}
+            {" "}키는 브라우저에서 해당 제공자로만 직접 전송되며 저장되지 않는다.
+          </div>
+        </div>
+
+        {/* 작가/작품 정보 및 요구사항 */}
+        <p className="dk-label">작가 · 작품 정보 및 요구사항 (선택)</p>
+        <p className="dk-hint">
+          작품·작가에 대한 배경뿐 아니라 분석에 대한 <b>요구사항</b>도 적을 수 있습니다. 호출에 함께 전달됩니다.<br />
+          · 특정 질문을 더 깊이 분석 요청 (예: “II-1 문장의 리듬을 더 자세히”)<br />
+          · ‘가능한 독법(V-5)’에 관점 추가 (예: “탈식민 관점 포함”)<br />
+          · 목록에 없는 질문을 직접 추가 → 결과 맨 끝 <b>7번 항목</b>으로 출력
+        </p>
+        <textarea className="dk-ta info" value={info} onChange={(e) => setInfo(e.target.value)}
+          placeholder={"예) 화자의 내면을 직접 서술하지 않는 문체를 의도했다.\nII-1 문장의 리듬을 특히 자세히 봐 달라.\n가능한 독법에 생태비평 관점을 추가해 달라.\n추가 질문: 제목과 본문의 관계는 어떠한가?"} />
+        <div className="dk-meta">{info.length.toLocaleString()}자 · 약 {estWords(info).toLocaleString()}단어 · 추정 {estTokens(info).toLocaleString()}토큰</div>
+
+        {/* 작품 본문 */}
+        <p className="dk-label">작품 본문</p>
+        <textarea className="dk-ta work" value={work} maxLength={MAX_WORK} onChange={(e) => setWork(e.target.value)}
+          placeholder="여기에 작품 전문 또는 발췌를 붙여넣으세요. (최대 50,000자)" />
+        <div className={"dk-meta" + (overLimit ? " warn" : "")}>
+          {work.length.toLocaleString()} / {MAX_WORK.toLocaleString()}자 · 약 {estWords(work).toLocaleString()}단어 · 추정 {est.workTok.toLocaleString()}토큰{overLimit ? " · 최대치 도달" : ""}
+        </div>
+
+        {/* 비용 패널 */}
+        <div className="dk-cost">
+          <div className="dk-costhd">토큰 · 비용 — {curModel.label} · 단일 호출</div>
+          <div className="dk-costbody">
+            <div className="dk-crow"><span>선택 질문</span><b>{n}개 (1회 호출)</b></div>
+            <div className="dk-crow"><span>본문(추정)</span><b>{est.workTok.toLocaleString()} <span className="sub">≈ {approxCh(est.workTok)}자</span></b></div>
+            <div className="dk-crow"><span>입력 합(추정)</span><b>{est.inputTok.toLocaleString()} <span className="sub">≈ {approxCh(est.inputTok)}자</span></b></div>
+            <div className="dk-crow"><span>출력 상한</span><b>{est.outMax.toLocaleString()} <span className="sub">≈ {approxCh(est.outMax)}자</span></b></div>
+            <div className="dk-crow big"><span>예상 비용 · 첫 분석</span><b>{usd(est.costFull)} · {krw(est.costFull)}</b></div>
+            <div className="dk-crow big save"><span>같은 본문 재분석(캐시)</span><b>{usd(est.costCached)} · {krw(est.costCached)}</b></div>
+            <div className="dk-crow"><span>실제 사용(누적)</span><b>{usage.calls}회 · 입력 {usage.inTok.toLocaleString()}{usage.cacheRead > 0 ? ` (캐시 ${usage.cacheRead.toLocaleString()})` : ""} / 출력 {usage.outTok.toLocaleString()}</b></div>
+            <div className="dk-crow big"><span>실제 비용(누적)</span><b>{usd(usage.cost)} · {krw(usage.cost)}</b></div>
+          </div>
+          <div className="dk-costfoot">
+            <b>토큰이란?</b> AI가 글을 다루는 최소 단위예요. 한국어는 대략 한 글자가 1토큰 안팎, 영어는 한 단어가 1~2토큰 정도라고 보면 됩니다(위 ‘≈자’는 본문 기준 근사 환산). · 모든 질문을 하나로 묶어 호출하므로 본문은 질문 수와 무관하게 1회만 과금됩니다. 같은 본문으로 질문을 바꿔 재분석하면 캐시가 적중해 입력비가 ‘재분석(캐시)’ 수준으로 떨어집니다. 정확한 과금은 호출 후 ‘실제 사용’을 따릅니다. 환율 가정 ₩{KRW_RATE.toLocaleString()}/$.
+          </div>
+        </div>
+
+        {/* 질문 선택 */}
+        <div className="dk-toolbar">
+          <span className="dk-tcount">선택된 질문 <b>{n}</b> / {ALL_QIDS.length}</span>
+          <button className="dk-link" onClick={() => setAll(true)}>전체 선택</button>
+          <button className="dk-link" onClick={() => setAll(false)}>전체 해제</button>
+        </div>
+
+        {GROUPS.map((g) => {
+          const ids = g.questions.map((q) => q.id);
+          const allOn = ids.every((id) => selected[id]);
+          return (
+            <section className="dk-group" key={g.id}>
+              <div className="dk-ghead">
+                <span className="dk-num">{g.id}</span>
+                <h2 className="dk-gtitle">{g.title}</h2>
+                <button className="dk-gpick" onClick={() => toggleGroup(g)}>{allOn ? "묶음 해제" : "묶음 선택"}</button>
+                <span className="dk-gcap">{g.caption}</span>
+              </div>
+              {g.questions.map((q) => {
+                const on = !!selected[q.id];
+                return (
+                  <button key={q.id} className={"dk-q" + (on ? " on" : "")} onClick={() => toggle(q.id)} aria-pressed={on}>
+                    <span className="dk-box">{on ? "■" : "□"}</span>
+                    <span className="dk-qid">{q.id}</span>{q.label}
+                  </button>
+                );
+              })}
+            </section>
+          );
+        })}
+
+        {/* 통합 결과 */}
+        {result && (
+          <section className="dk-result">
+            <div className="dk-rhead">
+              <span>통합 분석 결과</span>
+              {hasResult && ru && (
+                <small>{ru.modelLabel} · 입력 {ru.inTok.toLocaleString()}{ru.cacheRead > 0 ? ` (캐시 ${ru.cacheRead.toLocaleString()})` : ""} / 출력 {ru.outTok.toLocaleString()} · {usd(ru.cost)}</small>
+              )}
+            </div>
+            <div className="dk-rbody">
+              {result.status === "loading" && <div className="dk-load">분석 중… (질문이 많을수록 시간이 걸립니다)</div>}
+              {result.status === "error" && <div className="dk-err">오류 · {result.text}</div>}
+              {hasResult && <div className="dk-md" dangerouslySetInnerHTML={{ __html: mdToHtml(result.text) }} />}
+            </div>
+            {hasResult && (
+              <div className="dk-ractions">
+                <input className="dk-titlein" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="내보내기 제목 (예: 「작품명」 분석)" />
+                <button className="dk-xbtn" onClick={copyResult}>전체 복사</button>
+                <button className="dk-xbtn" onClick={exportPDF}>PDF로 내보내기</button>
+                <button className="dk-xbtn" onClick={exportDocx} disabled={exporting}>{exporting ? "생성 중…" : "Word(.docx)로 내보내기"}</button>
+              </div>
+            )}
+          </section>
+        )}
+
+        <div className="dk-runbar">
+          <button className="dk-run" disabled={!canRun} onClick={run}>{running ? "분석 중…" : (hasResult ? "다시 분석" : "분석 시작")}</button>
+          {!work.trim() && <span className="dk-progress">본문을 먼저 붙여넣으세요.</span>}
+          {work.trim() && n === 0 && <span className="dk-progress">질문을 하나 이상 고르세요.</span>}
+          {work.trim() && n > 0 && !apiKey.trim() && <span className="dk-progress">API 키가 없으면 호출이 실패할 수 있습니다.</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
